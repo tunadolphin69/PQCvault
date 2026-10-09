@@ -1,5 +1,24 @@
 # QP Vault
 
+> **Read this first**
+>
+> - **Experimental and unaudited.** No independent security review has been
+>   done. It passes the tests described below on a local validator, and that
+>   is all that can be said for it. Bugs in this kind of software can lose
+>   funds permanently.
+> - **Not deployed.** The program is not live on Solana mainnet. This
+>   repository is source code. Anyone who deploys it does so themselves and
+>   at their own risk.
+> - **Not affiliated.** This is an independent project. It is not made by,
+>   endorsed by, or connected to pqc.market, pump.fun, the Solana Foundation,
+>   or any other project or company. It is unrelated to the `pqc-vault`
+>   repository published by pqc.market.
+> - **No token is part of this software.** Nothing here needs a token to
+>   work. A token that links to this repository does not make the code
+>   audited, safe, or finished, and gives no rights to it.
+> - **No warranty.** Provided as is. Nothing here is financial advice.
+>   Use devnet. Do not put in money you are not prepared to lose.
+
 A Solana vault for SOL and tokens that no elliptic-curve key can open. Funds
 leave only when the on-chain program verifies a hash-based (Winternitz)
 one-time signature, so recovering an ed25519 private key, by quantum computer
@@ -7,11 +26,6 @@ or any other way, gets an attacker nothing.
 
 It holds SOL, SPL tokens and Token-2022 tokens (the kind pump.fun coins use)
 at one permanent address, and every payment is a single transaction.
-
-**Status: experimental and unaudited.** It passes every test described below
-on a local validator. Nobody other than its author has reviewed it. Use it on
-devnet. Do not put money you care about in it until someone independent has
-audited the program.
 
 ## How it works
 
