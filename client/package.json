@@ -1,0 +1,21 @@
+{
+  "name": "qp-vault-client",
+  "version": "0.1.0",
+  "description": "Wallet and CLI for QP Vault: Solana vaults opened only by hash-based one-time signatures",
+  "type": "module",
+  "bin": {
+    "qpv": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test test/unit.test.js",
+    "e2e": "node test/e2e.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0",
+    "bs58": "^6.0.0"
+  }
+}
