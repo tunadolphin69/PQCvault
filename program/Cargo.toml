@@ -2,6 +2,7 @@
 name = "qp_vault"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Solana vault whose funds only move with an on-chain-verified hash-based signature"
 
 [lib]

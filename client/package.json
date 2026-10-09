@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Wallet and CLI for QP Vault: Solana vaults opened only by hash-based one-time signatures",
   "type": "module",
+  "license": "MIT",
   "bin": {
     "qpv": "src/cli.js"
   },

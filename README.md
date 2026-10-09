@@ -16,8 +16,12 @@
 > - **No token is part of this software.** Nothing here needs a token to
 >   work. A token that links to this repository does not make the code
 >   audited, safe, or finished, and gives no rights to it.
-> - **No warranty.** Provided as is. Nothing here is financial advice.
->   Use devnet. Do not put in money you are not prepared to lose.
+> - **No warranty, no liability.** Provided as is. The author and
+>   contributors are not responsible for any loss of funds or any other
+>   loss or damage from using, deploying or relying on this software. You
+>   use it entirely at your own risk. See [LICENSE](LICENSE).
+> - **Not financial advice.** Use devnet. Do not put in money you are not
+>   prepared to lose.
 
 A Solana vault for SOL and tokens that no elliptic-curve key can open. Funds
 leave only when the on-chain program verifies a hash-based (Winternitz)
@@ -215,3 +219,9 @@ party relays it, reports a payment as not sent when another copy of the
 wallet used the key first, refuses stale RPC data, and refuses frozen,
 hooked, paused and non-transferable tokens and misdirected recipients before
 signing.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE). The software is provided "as is", without
+warranty of any kind, and the authors are not liable for any claim, damages
+or losses arising from it.
