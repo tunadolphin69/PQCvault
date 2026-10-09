@@ -1,5 +1,6 @@
 // Vault address, on-chain state, and the instructions the program accepts.
 
+import { Buffer } from 'buffer';
 import {
   ComputeBudgetProgram,
   PublicKey,

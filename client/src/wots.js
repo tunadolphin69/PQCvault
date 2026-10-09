@@ -2,8 +2,13 @@
 //
 // This file must stay byte-for-byte in step with program/src/wots.rs. The
 // shared test vector in test/vector.json is checked by both sides.
+//
+// It runs unchanged in Node and in a browser: hashing comes from
+// @noble/hashes, not from either platform's built-ins.
 
-import { createHash, createHmac } from 'node:crypto';
+import { Buffer } from 'buffer';
+import { hmac as nobleHmac } from '@noble/hashes/hmac.js';
+import { sha256 as nobleSha256 } from '@noble/hashes/sha2.js';
 
 export const N = 24; // bytes kept from each SHA-256 output
 export const MSG_DIGITS = 24; // signed message digest bytes, one chain each
@@ -18,16 +23,18 @@ const TAG_PUBKEY = 1;
 const TAG_MESSAGE = 2;
 const TAG_CANCEL = 3;
 
+const bytes = (part) => (typeof part === 'string' ? Buffer.from(part, 'utf8') : part);
+
 const sha256 = (...parts) => {
-  const h = createHash('sha256');
-  for (const p of parts) h.update(p);
-  return h.digest();
+  const h = nobleSha256.create();
+  for (const p of parts) h.update(bytes(p));
+  return Buffer.from(h.digest());
 };
 
 const hmac = (key, ...parts) => {
-  const h = createHmac('sha256', key);
-  for (const p of parts) h.update(p);
-  return h.digest();
+  const h = nobleHmac.create(nobleSha256, key);
+  for (const p of parts) h.update(bytes(p));
+  return Buffer.from(h.digest());
 };
 
 const u32be = (n) => {

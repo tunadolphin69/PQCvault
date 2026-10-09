@@ -33,7 +33,8 @@ import {
   spendTokenInstruction,
   vaultAddress,
 } from '../src/vault.js';
-import { Wallet, formatSol, formatUnits, parseSol, parseUnits } from '../src/wallet.js';
+import { createFileWallet, loadFileWallet } from '../src/file-wallet.js';
+import { explainError, formatSol, formatUnits, keypairSigner, parseSol, parseUnits, requireImmutableProgram } from '../src/wallet.js';
 import {
   CHAINS,
   CHAIN_STEPS,
@@ -351,26 +352,30 @@ function fakeChain() {
 /** The vault instruction's signed fields inside a serialized transaction (its last 712 bytes). */
 const signedBytes = (raw) => raw.subarray(raw.length - 712).toString('hex');
 
-function newWallet(masterSeed) {
-  const path = join(mkdtempSync(join(tmpdir(), 'qpv-')), 'wallet.json');
-  return Wallet.create(path, { programId, url: 'http://unused', masterSeed });
-}
+const newPath = () => join(mkdtempSync(join(tmpdir(), 'qpv-')), 'wallet.json');
+const newWallet = (masterSeed) => createFileWallet(newPath(), { programId, url: 'http://unused', masterSeed });
+/** The same wallet file opened again, as after a restart. */
+const reopen = (w) => loadFileWallet(w.store.path);
 
 /** A wallet whose vault is open on `chain` and holds `sol` spendable SOL. */
 async function funded(chain, sol = 2n) {
   const w = newWallet();
-  await w.open(chain, Keypair.generate());
+  await w.open(chain, payer());
   chain.fund(w.address, sol * 1_000_000_000n);
   chain.sent.length = 0;
   return w;
 }
 
-const payer = () => Keypair.generate();
+const payer = () => keypairSigner(Keypair.generate());
 
 test('wallet file is private and refuses to be overwritten', () => {
   const w = newWallet();
-  assert.equal(statSync(w.path).mode & 0o777, 0o600);
-  assert.throws(() => Wallet.create(w.path, { programId, url: 'x' }));
+  assert.equal(statSync(w.store.path).mode & 0o777, 0o600);
+  assert.throws(() => createFileWallet(w.store.path, { programId, url: 'x' }));
+  // The seed is in the file, and survives saves that only touch the state.
+  w.save();
+  assert.deepEqual(reopen(w).masterSeed, w.masterSeed);
+  assert.equal('masterSeed' in w.state, false);
 });
 
 test('open creates the vault; early deposits survive; nothing is spendable from the reserve', async () => {
@@ -399,14 +404,14 @@ test('a normal SOL payment: locked on disk before signing, then moves to the nex
 
   w.commit(plan);
   // The lock is on disk before any signature exists.
-  assert.equal(Wallet.load(w.path).pending.recipient, to.toBase58());
+  assert.equal(reopen(w).pending.recipient, to.toBase58());
   assert.equal(chain.sent.length, 0);
 
   const result = await w.sendPending(chain, payer());
   assert.equal(result.outcome, 'sent');
   assert(chain.landed.has(result.txid));
   assert.equal(await chain.getBalance(to), 500_000_000);
-  const reloaded = Wallet.load(w.path);
+  const reloaded = reopen(w);
   assert.equal(reloaded.pending, null);
   assert.equal(reloaded.state.sequence, 1);
   assert.deepEqual(
@@ -435,7 +440,7 @@ test('a failed send keeps the lock, and every retry signs the identical message'
   assert.match(first.error.message, /rpc went away/);
 
   // Still locked, across a restart, and a different payment is refused.
-  const again = Wallet.load(w.path);
+  const again = reopen(w);
   assert.equal(again.pending.amount, '1000000000');
   assert.equal(again.state.sequence, 0);
   await assert.rejects(again.planSol(chain, someone(), '0.1'), /already pending/);
@@ -448,7 +453,7 @@ test('a failed send keeps the lock, and every retry signs the identical message'
   assert.equal((await again.sendPending(chain, payer())).outcome, 'sent');
   assert.equal(chain.sent.length, 3);
   assert.equal(new Set(chain.sent.map(signedBytes)).size, 1);
-  assert.equal(Wallet.load(w.path).state.sequence, 1);
+  assert.equal(reopen(w).state.sequence, 1);
 });
 
 test('a send reported as failed that actually landed is recorded, not repeated', async () => {
@@ -475,10 +480,11 @@ test('if the wallet died right after broadcasting, resume finds the payment and 
   const { txid } = await w.sendPending(chain, payer());
 
   // Rewind the file to what was on disk at the moment of broadcast.
-  const reopened = Wallet.load(w.path);
+  const reopened = reopen(w);
   reopened.state.pending = { ...locked, txids: [{ id: txid, kind: 'pay' }] };
   reopened.state.sequence = 0;
   reopened.state.history = [];
+  reopened.save();
   assert.deepEqual(await reopened.sendPending(chain, payer()), { outcome: 'sent', txid });
   assert.equal(chain.sent.length, 1);
   assert.equal(reopened.state.sequence, 1);
@@ -496,7 +502,7 @@ test('a payment relayed by someone else is still recognised as sent', async () =
   assert.equal((await w.sendPending(chain, payer())).outcome, 'pending');
 
   const ours = Transaction.from(chain.sent[0]);
-  const relayer = payer();
+  const relayer = Keypair.generate();
   const relayed = new Transaction({ feePayer: relayer.publicKey, blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 1 }).add(ours.instructions.at(-1));
   relayed.sign(relayer);
   await chain.sendRawTransaction(relayed.serialize());
@@ -509,8 +515,7 @@ test('a payment relayed by someone else is still recognised as sent', async () =
 test('if another copy of the wallet used the key first, the payment is reported as NOT sent', async () => {
   const chain = fakeChain();
   const a = await funded(chain, 5n);
-  const b = Wallet.load(a.path); // same seed, e.g. a second machine
-  b.path = join(mkdtempSync(join(tmpdir(), 'qpv-')), 'b.json');
+  const b = newWallet(a.masterSeed); // same seed in a different wallet file, e.g. a second machine
 
   const mine = Keypair.generate().publicKey;
   b.commit(await b.planSol(chain, mine.toBase58(), '2')); // B is about to pay with key #0...
@@ -768,4 +773,146 @@ test('if the payment lands before the cancel does, it is reported as sent', asyn
   assert.equal(result.outcome, 'sent');
   assert.equal(await chain.getBalance(to), 1_000_000_000);
   assert.equal(chain.sent.length, 2); // no cancel was signed or sent
+});
+
+// --------------------------------------------------- fee wallets and tabs
+
+test('a fee wallet that refuses to sign has still seen the signature, so the payment stays locked', async () => {
+  const chain = fakeChain();
+  const w = await funded(chain);
+  const to = Keypair.generate().publicKey;
+  w.commit(await w.planSol(chain, to.toBase58(), '1'));
+  assert.equal(w.pending.exposed, false);
+
+  const refusing = { publicKey: Keypair.generate().publicKey, signTransaction: async () => { throw new Error('User rejected the request.'); } };
+  const result = await w.sendPending(chain, refusing);
+  assert.equal(result.outcome, 'pending');
+  assert.match(result.error.message, /rejected/);
+  assert.equal(chain.sent.length, 0);
+  assert.equal(reopen(w).pending.exposed, true); // recorded on disk before the fee wallet was asked
+
+  // So calling it off takes a real on-chain cancel, not just dropping the lock.
+  const cancelled = await w.cancelPending(chain, payer());
+  assert.equal(cancelled.outcome, 'cancelled');
+  assert(chain.landed.has(cancelled.txid));
+  assert.equal(w.state.sequence, 1);
+  assert.equal(await chain.getBalance(to), 0);
+});
+
+test('a fee wallet may add to the transaction but not change the vault instruction', async () => {
+  const chain = fakeChain();
+  const w = await funded(chain);
+  const to = Keypair.generate().publicKey;
+  w.commit(await w.planSol(chain, to.toBase58(), '1'));
+
+  const kp = Keypair.generate();
+  const tampering = {
+    publicKey: kp.publicKey,
+    signTransaction: async (tx) => {
+      const ix = tx.instructions.at(-1);
+      ix.data = Buffer.from(ix.data);
+      ix.data[5] ^= 1; // nudge the amount
+      tx.partialSign(kp);
+      return tx;
+    },
+  };
+  const bad = await w.sendPending(chain, tampering);
+  assert.equal(bad.outcome, 'pending');
+  assert.match(bad.error.message, /different transaction/);
+  assert.equal(chain.sent.length, 0);
+
+  // One that prepends its own instruction, as some wallets do, is fine.
+  const adding = {
+    publicKey: kp.publicKey,
+    signTransaction: async (tx) => {
+      tx.instructions.unshift(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: kp.publicKey, lamports: 0 }));
+      tx.partialSign(kp);
+      return tx;
+    },
+  };
+  assert.equal((await w.sendPending(chain, adding)).outcome, 'sent');
+  assert.equal(await chain.getBalance(to), 1_000_000_000);
+});
+
+test('two copies sharing one store (two browser tabs) cannot both lock the same key', async () => {
+  const chain = fakeChain();
+  const a = await funded(chain);
+  const b = reopen(a); // same file, loaded separately
+  const planA = await a.planSol(chain, someone(), '0.5');
+  const planB = await b.planSol(chain, someone(), '0.7');
+  a.commit(planA);
+  assert.throws(() => b.commit(planB), /already pending/);
+  await assert.rejects(b.planSol(chain, someone(), '0.1'), /already pending/);
+
+  // B can finish A's payment, and both then agree on where the vault is.
+  assert.equal((await b.sendPending(chain, payer())).outcome, 'sent');
+  assert.equal((await a.planSol(chain, someone(), '0.1')).index, 1);
+  assert.equal(chain.sent.length, 1);
+});
+
+test('a fee wallet that cannot afford the payment is caught before the key is locked', async () => {
+  const chain = fakeChain();
+  const w = await funded(chain);
+  const fee = Keypair.generate().publicKey;
+  const sol = await w.planSol(chain, someone(), '1');
+  await assert.rejects(w.requireFeeFunds(chain, fee, sol), /fee wallet needs at least 0.00001 SOL .* has 0/);
+  chain.fund(fee, 10_000n);
+  await w.requireFeeFunds(chain, fee, sol);
+
+  // Creating the recipient's token account needs rent as well.
+  const mint = chain.mint();
+  chain.tokens(mint, w.address, 5_000000n);
+  const token = await w.planToken(chain, mint.toBase58(), someone(), '1');
+  assert.equal(token.createAccount, true);
+  await assert.rejects(w.requireFeeFunds(chain, fee, token), /needs at least 0.00221 SOL/);
+  chain.fund(fee, 2_200_000n);
+  await w.requireFeeFunds(chain, fee, token);
+  assert.equal(w.pending, null);
+});
+
+// ------------------------------------------------------- program checks
+
+test('a program that can still be upgraded is refused', async () => {
+  const chain = fakeChain();
+  const loader = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+  const deploy = (authority) => {
+    const program = Keypair.generate().publicKey;
+    const programData = Keypair.generate().publicKey;
+    const head = Buffer.alloc(36);
+    head.writeUInt32LE(2, 0);
+    programData.toBuffer().copy(head, 4);
+    chain.accounts.set(program.toBase58(), { lamports: 1n, owner: loader, data: head, executable: true });
+    const data = Buffer.alloc(45 + 100);
+    data.writeUInt32LE(3, 0);
+    if (authority) {
+      data[12] = 1;
+      authority.toBuffer().copy(data, 13);
+    }
+    chain.accounts.set(programData.toBase58(), { lamports: 1n, owner: loader, data, executable: false });
+    return program;
+  };
+
+  await requireImmutableProgram(chain, deploy(null)); // final: fine
+  const authority = Keypair.generate().publicKey;
+  await assert.rejects(requireImmutableProgram(chain, deploy(authority)), new RegExp(`can still be changed by whoever holds ${authority.toBase58()}`));
+  await assert.rejects(requireImmutableProgram(chain, Keypair.generate().publicKey), /no program at/);
+  const wallet = Keypair.generate().publicKey;
+  chain.fund(wallet, 5n);
+  await assert.rejects(requireImmutableProgram(chain, wallet), /is not a program/);
+  // An old-style loader has no upgrade mechanism at all.
+  const old = Keypair.generate().publicKey;
+  chain.accounts.set(old.toBase58(), { lamports: 1n, owner: new PublicKey('BPFLoader2111111111111111111111111111111111'), data: Buffer.alloc(8), executable: true });
+  await requireImmutableProgram(chain, old);
+  const odd = Keypair.generate().publicKey;
+  chain.accounts.set(odd.toBase58(), { lamports: 1n, owner: Keypair.generate().publicKey, data: Buffer.alloc(8), executable: true });
+  await assert.rejects(requireImmutableProgram(chain, odd), /cannot check/);
+});
+
+test('errors are turned into one readable line', () => {
+  assert.equal(explainError({ message: 'x', logs: ['Program log: Instruction: TransferChecked', 'Program log: Error: Account is frozen'] }), 'Account is frozen');
+  assert.match(explainError({ message: 'Simulation failed. ', transactionError: { message: 'Attempt to debit an account but found no record of a prior credit.' } }), /fee wallet does not have enough SOL/);
+  assert.match(explainError(new TypeError('Failed to fetch')), /Could not reach the Solana network/);
+  assert.match(explainError(Object.assign(new Error('User rejected the request.'), { code: 4001 })), /declined/);
+  assert.equal(explainError(new Error('first line\nsecond line')), 'first line');
+  assert.equal(explainError(new Error('y'.repeat(500))).length, 301);
 });

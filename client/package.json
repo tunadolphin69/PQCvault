@@ -1,7 +1,7 @@
 {
   "name": "qp-vault-client",
   "version": "0.1.0",
-  "description": "Wallet and CLI for QP Vault: Solana vaults opened only by hash-based one-time signatures",
+  "description": "Wallet for QP Vault: command line tool and web page",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -9,14 +9,26 @@
   },
   "scripts": {
     "test": "node --test test/unit.test.js",
-    "e2e": "node test/e2e.mjs"
+    "e2e": "node test/e2e.mjs",
+    "web:dev": "vite",
+    "web:build": "vite build",
+    "web:preview": "vite preview",
+    "web:e2e": "node test/web.e2e.mjs"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
+    "@fontsource-variable/archivo": "^5.3.0",
+    "@fontsource/ibm-plex-mono": "^5.3.0",
+    "@noble/hashes": "^2.4.0",
     "@solana/spl-token": "^0.4.15",
     "@solana/web3.js": "^1.99.0",
-    "bs58": "^6.0.0"
+    "bs58": "^6.0.0",
+    "buffer": "^6.0.3"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.64.0",
+    "vite": "^8.3.4"
   }
 }

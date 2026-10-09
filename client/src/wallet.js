@@ -6,14 +6,19 @@
 // `sequence + 1`.
 //
 // THE RULE: before a signature with key k is created, the exact payment is
-// written to disk as `pending`. From then on key k can only ever sign that
-// payment again (or be retired by cancelling it), until the chain shows the
-// vault has moved past k. A crash, a dropped transaction or an expired
-// blockhash therefore never leads to a second, different signature.
+// saved as `pending`. From then on key k can only ever sign that payment
+// again (or be retired by cancelling it), until the chain shows the vault
+// has moved past k. A crash, a dropped transaction or an expired blockhash
+// therefore never leads to a second, different signature.
+//
+// This file is portable: it runs in Node (see file-wallet.js) and in a
+// browser (see web/). Where the state is kept and who pays the network fee
+// are both passed in:
+//
+//   store     { save(state), load?() }       keeps the wallet state durable
+//   feePayer  { publicKey, signTransaction }  an ordinary Solana signer
 
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
-import { randomBytes } from 'node:crypto';
-import { dirname } from 'node:path';
+import { Buffer } from 'buffer';
 import { PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
 import {
   ExtensionType,
@@ -68,60 +73,125 @@ export function formatUnits(amount, decimals) {
 export const parseSol = (text) => parseUnits(text, 9);
 export const formatSol = (lamports) => formatUnits(lamports, 9);
 
+/** One readable line from an RPC, wallet-extension or program error. */
+export function explainError(error) {
+  const logs = error?.logs ?? error?.transactionLogs ?? [];
+  const said = logs.find((line) => line.startsWith('Program log: Error: '));
+  if (said) return said.slice('Program log: Error: '.length);
+  const all = [error?.transactionError?.message, error?.message ?? String(error)].filter(Boolean).join(' ');
+  if (/no record of a prior credit|insufficient lamports|insufficient funds for (fee|rent)/i.test(all)) {
+    return 'The fee wallet does not have enough SOL. Send a little SOL to it and try again.';
+  }
+  if (/failed to fetch|networkerror|load failed|fetch failed|ECONNREFUSED/i.test(all)) {
+    return 'Could not reach the Solana network. Check your connection and the RPC address.';
+  }
+  if (/user rejected/i.test(all)) return 'You declined the request in your wallet extension.';
+  const text = (error?.transactionError?.message ?? error?.message ?? String(error)).split('\n')[0].trim();
+  return text.length > 300 ? `${text.slice(0, 300)}…` : text;
+}
+
+const UPGRADEABLE_LOADER = new PublicKey('BPFLoaderUpgradeab1e11111111111111111111111');
+const FROZEN_LOADERS = ['BPFLoader2111111111111111111111111111111111', 'BPFLoader1111111111111111111111111111111111'];
+
+/**
+ * Refuse a program that someone can still change.
+ *
+ * Whoever holds a program's upgrade key can replace its code and empty every
+ * vault under it, and that key is an ordinary ed25519 key. So a vault should
+ * only ever be created under a program whose upgrade authority is gone.
+ */
+export async function requireImmutableProgram(conn, programId) {
+  programId = new PublicKey(programId);
+  const info = await conn.getAccountInfo(programId);
+  if (!info) throw new Error(`there is no program at ${programId.toBase58()} on this network`);
+  if (!info.executable) throw new Error(`${programId.toBase58()} is not a program`);
+  if (FROZEN_LOADERS.includes(info.owner.toBase58())) return;
+  if (!info.owner.equals(UPGRADEABLE_LOADER) || info.data.length < 36 || Buffer.from(info.data).readUInt32LE(0) !== 2) {
+    throw new Error('this program uses a loader this wallet cannot check, so it cannot confirm the program is unchangeable');
+  }
+  const programData = await conn.getAccountInfo(new PublicKey(info.data.subarray(4, 36)));
+  if (!programData || programData.data.length < 13 || Buffer.from(programData.data).readUInt32LE(0) !== 3) {
+    throw new Error('could not read this program\'s upgrade settings');
+  }
+  if (programData.data[12] !== 0) {
+    const authority = new PublicKey(programData.data.subarray(13, 45)).toBase58();
+    throw new Error(
+      `this program can still be changed by whoever holds ${authority}, so a vault under it would not be safe. It has to be deployed as final first.`,
+    );
+  }
+}
+
+/** 32 fresh random bytes from the platform's secure generator. */
+export function randomSeed() {
+  const bytes = new Uint8Array(32);
+  globalThis.crypto.getRandomValues(bytes);
+  return Buffer.from(bytes);
+}
+
+/** Use a plain keypair as the fee payer. */
+export function keypairSigner(keypair) {
+  return {
+    publicKey: keypair.publicKey,
+    signTransaction: async (tx) => {
+      tx.partialSign(keypair);
+      return tx;
+    },
+  };
+}
+
 export class Wallet {
-  constructor(path, state) {
-    this.path = path;
+  /**
+   * `state` is everything that is safe to store as-is. The master seed is
+   * handed over separately so a store can keep it however it sees fit
+   * (in the same file, encrypted, ...).
+   */
+  constructor(store, state, masterSeed) {
+    if (state.version !== 2) throw new Error(`unsupported wallet version ${state.version}`);
+    if (!Buffer.isBuffer(masterSeed) || masterSeed.length !== 32) throw new Error('master seed must be 32 bytes');
+    this.store = store;
     this.state = state;
-    this.masterSeed = Buffer.from(state.masterSeed, 'hex');
+    this.masterSeed = masterSeed;
     this.programId = new PublicKey(state.programId);
     this.address = new PublicKey(state.address);
+    this.keys = new Map();
   }
 
-  static create(path, { programId, url, masterSeed = randomBytes(32) }) {
-    if (masterSeed.length !== 32) throw new Error('master seed must be 32 bytes');
+  /** The state of a brand-new wallet for `masterSeed`. Not saved yet. */
+  static initialState({ programId, url, masterSeed }) {
     programId = new PublicKey(programId);
-    const wallet = new Wallet(path, {
+    return {
       version: 2,
       programId: programId.toBase58(),
       url,
       address: vaultAddress(programId, deriveVaultKey(masterSeed, 0).keyHash).toBase58(),
-      masterSeed: masterSeed.toString('hex'),
       // Lowest key number this wallet may still sign with. Only ever goes up.
       sequence: 0,
       pending: null,
       history: [],
-    });
-    wallet.save({ mustNotExist: true });
-    return wallet;
+    };
   }
 
-  static load(path) {
-    const state = JSON.parse(readFileSync(path, 'utf8'));
-    if (state.version !== 2) throw new Error(`unsupported wallet version ${state.version}`);
-    return new Wallet(path, state);
+  save() {
+    this.store.save(this.state);
   }
 
-  /** Write the state so that it is either fully on disk or not changed at all. */
-  save({ mustNotExist = false } = {}) {
-    mkdirSync(dirname(this.path), { recursive: true });
-    const body = JSON.stringify(this.state, null, 2) + '\n';
-    if (mustNotExist) {
-      const fd = openSync(this.path, 'wx', 0o600); // fails if the file exists
-      writeSync(fd, body);
-      fsyncSync(fd);
-      closeSync(fd);
-      return;
-    }
-    const tmp = `${this.path}.tmp`;
-    const fd = openSync(tmp, 'w', 0o600);
-    writeSync(fd, body);
-    fsyncSync(fd);
-    closeSync(fd);
-    renameSync(tmp, this.path);
+  /**
+   * Pick up anything another copy of this wallet (a second browser tab, a
+   * second process) has saved since we last looked.
+   */
+  reload() {
+    const fresh = this.store.load?.();
+    if (fresh) this.state = fresh;
   }
 
   key(index) {
-    return deriveVaultKey(this.masterSeed, index);
+    let key = this.keys.get(index);
+    if (!key) {
+      key = deriveVaultKey(this.masterSeed, index);
+      if (this.keys.size > 8) this.keys.clear();
+      this.keys.set(index, key);
+    }
+    return key;
   }
 
   get pending() {
@@ -142,6 +212,7 @@ export class Wallet {
    *  - the vault's current key is not ours: refuse.
    */
   async sync(conn) {
+    this.reload();
     const info = await conn.getAccountInfo(this.address);
     const reserve = BigInt(await conn.getMinimumBalanceForRentExemption(STATE_LEN));
     const lamports = BigInt(info?.lamports ?? 0);
@@ -282,8 +353,8 @@ export class Wallet {
     const blockhash = await conn.getLatestBlockhash();
     tx.feePayer = feePayer.publicKey;
     tx.recentBlockhash = blockhash.blockhash;
-    tx.sign(feePayer);
-    const txid = await conn.sendRawTransaction(tx.serialize());
+    const signedTx = await feePayer.signTransaction(tx);
+    const txid = await conn.sendRawTransaction(signedTx.serialize());
     const result = await conn.confirmTransaction({ signature: txid, ...blockhash });
     if (result.value.err) throw new Error(`transaction failed: ${JSON.stringify(result.value.err)}`);
     return txid;
@@ -435,6 +506,22 @@ export class Wallet {
     };
   }
 
+  /**
+   * Check that the fee payer can afford `plan` before the key is locked to
+   * it. Running out of fee money is the most ordinary way for a payment to
+   * fail, and after `commit` a failure costs a cancel.
+   */
+  async requireFeeFunds(conn, feePayerKey, plan, { microLamportsPerCu = 0 } = {}) {
+    const priority = (BigInt(microLamportsPerCu) * 1_400_000n) / 1_000_000n;
+    // A new token account costs its creator about 0.0021 SOL in rent.
+    const rent = plan.createAccount ? 2_200_000n : 0n;
+    const need = 10_000n + priority + rent;
+    const have = BigInt(await conn.getBalance(feePayerKey));
+    if (have < need) {
+      throw new Error(`the fee wallet needs at least ${formatSol(need)} SOL for this payment and has ${formatSol(have)}`);
+    }
+  }
+
   // ----------------------------------------------------------- committing
 
   #message(p) {
@@ -452,8 +539,9 @@ export class Wallet {
 
   /** Lock key `plan.index` to this one payment. Saved before anything is signed. */
   commit(plan) {
+    this.reload();
     if (this.state.pending) throw new Error('a payment is already pending');
-    if (plan.index !== this.state.sequence) throw new Error('plan is out of date; run it again');
+    if (plan.index !== this.state.sequence) throw new Error('the vault has changed since this payment was reviewed; review it again');
     const pending = {
       index: plan.index,
       asset: plan.asset,
@@ -464,6 +552,9 @@ export class Wallet {
       createAccount: plan.createAccount ?? false,
       amount: plan.amount.toString(),
       createdAt: new Date().toISOString(),
+      // Set once the signature has been handed to anything outside this
+      // wallet: the network, or a fee wallet such as a browser extension.
+      exposed: false,
       txids: [], // every transaction we have broadcast for this payment: { id, kind }
     };
     pending.digest = describeMessage(this.#message(pending)).digest.toString('hex');
@@ -513,17 +604,18 @@ export class Wallet {
   }
 
   /**
-   * Call off the pending payment. If nothing was ever broadcast, the lock is
-   * simply dropped and the key stays unused. Otherwise the signature is
-   * already public, so the key is retired on-chain without paying. Same
-   * return shape as sendPending; a payment that lands first wins.
+   * Call off the pending payment. If its signature never left this wallet,
+   * the lock is simply dropped and the key stays unused. Otherwise the
+   * signature must be treated as public, so the key is retired on-chain
+   * without paying. Same return shape as sendPending; a payment that lands
+   * first wins.
    */
   async cancelPending(conn, feePayer, options = {}) {
+    this.reload();
     if (!this.state.pending) throw new Error('nothing is pending');
-    if (this.state.pending.txids.length === 0) {
-      // No transaction ever left this machine, so no signature exists anywhere.
+    if (!this.state.pending.exposed) {
       await this.sync(conn);
-      if (this.state.pending) {
+      if (this.state.pending && !this.state.pending.exposed) {
         this.#record(this.state.pending, 'cancelled', null);
         this.save();
       }
@@ -541,6 +633,7 @@ export class Wallet {
   }
 
   async #act(conn, feePayer, { microLamportsPerCu }, kind, build) {
+    this.reload();
     if (!this.state.pending) throw new Error('nothing is pending');
     await this.sync(conn); // settles `pending` if the vault has moved on
     if (!this.state.pending) return this.#outcome();
@@ -551,26 +644,42 @@ export class Wallet {
     if (signed.digest.toString('hex') !== p.digest) {
       throw new Error('internal error: the pending payment no longer matches its recorded digest; nothing was sent');
     }
+    const instructions = build(p, signed, message);
     const blockhash = await conn.getLatestBlockhash();
     const tx = buildTransaction({
-      instructions: build(p, signed, message),
+      instructions,
       units: computeLimit(signed.hashes, { token: kind === 'pay' && p.asset !== 'SOL' }),
       feePayer: feePayer.publicKey,
       microLamportsPerCu,
       ...blockhash,
     });
-    tx.sign(feePayer);
-    const raw = tx.serialize();
-    if (raw.length > MAX_TX_BYTES) throw new Error(`transaction is ${raw.length} bytes, limit ${MAX_TX_BYTES}`);
 
-    // Remember the transaction id before it leaves, so that whatever happens
-    // next we can ask the chain whether this exact transaction landed.
-    const txid = bs58.encode(tx.signature);
-    p.txids.push({ id: txid, kind });
+    // Our instruction exactly as built, to compare with what comes back.
+    const fingerprint = (ix) =>
+      [ix.programId.toBase58(), Buffer.from(ix.data).toString('hex'), ...ix.keys.map((k) => `${k.pubkey.toBase58()}:${k.isSigner}:${k.isWritable}`)].join('|');
+    const expected = fingerprint(instructions.at(-1));
+
+    // From the next line on, the vault's signature is in someone else's hands.
+    p.exposed = true;
     this.save();
 
     let error;
+    let txid;
     try {
+      const signedTx = await feePayer.signTransaction(tx);
+      // A fee wallet may add to a transaction; it must not touch our instruction.
+      if (!signedTx.instructions.some((ix) => fingerprint(ix) === expected)) {
+        throw new Error('the fee wallet returned a different transaction; nothing was sent');
+      }
+      const raw = signedTx.serialize();
+      if (raw.length > MAX_TX_BYTES) throw new Error(`transaction is ${raw.length} bytes, limit ${MAX_TX_BYTES}`);
+
+      // Remember the transaction id before it leaves, so that whatever
+      // happens next we can ask the chain whether this exact one landed.
+      txid = bs58.encode(signedTx.signature);
+      p.txids.push({ id: txid, kind });
+      this.save();
+
       await conn.sendRawTransaction(raw);
       const result = await conn.confirmTransaction({ signature: txid, ...blockhash });
       if (result.value.err) error = new Error(`transaction failed: ${JSON.stringify(result.value.err)}`);

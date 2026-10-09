@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { parseArgs } from 'node:util';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
-import { Wallet, formatSol, formatUnits } from './wallet.js';
+import { createFileWallet, loadFileWallet } from './file-wallet.js';
+import { explainError, formatSol, formatUnits, keypairSigner, requireImmutableProgram } from './wallet.js';
 
 const HELP = `qpv - a Solana vault for SOL and tokens, opened only by hash-based one-time signatures
 
@@ -48,14 +49,14 @@ const walletPath = opt.wallet ?? process.env.QPV_WALLET ?? join(homedir(), '.con
 
 const open = () => {
   if (!existsSync(walletPath)) throw new Error(`no wallet at ${walletPath}; run "qpv init" first`);
-  const wallet = Wallet.load(walletPath);
+  const wallet = loadFileWallet(walletPath);
   return { wallet, conn: new Connection(opt.url ?? wallet.state.url, 'confirmed') };
 };
 
 const feePayer = () => {
   const path = opt['fee-payer'] ?? join(homedir(), '.config', 'solana', 'id.json');
   if (!existsSync(path)) throw new Error(`no fee payer keypair at ${path}; pass --fee-payer`);
-  return Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(path, 'utf8'))));
+  return keypairSigner(Keypair.fromSecretKey(Uint8Array.from(JSON.parse(readFileSync(path, 'utf8')))));
 };
 
 const sendOptions = () =>
@@ -81,14 +82,6 @@ const describe = (p) =>
     ? `${formatSol(BigInt(p.amount))} SOL`
     : `${formatUnits(BigInt(p.amount), p.decimals)} of token ${p.asset}`;
 
-/** One readable line from an RPC or program error. */
-function explain(error) {
-  const logs = error?.logs ?? error?.transactionLogs ?? [];
-  const said = logs.find((line) => line.startsWith('Program log: Error: '));
-  if (said) return said.slice('Program log: Error: '.length);
-  return String(error?.message ?? error).split('\n')[0];
-}
-
 function report(result) {
   const id = result.txid ? `: ${result.txid}` : '';
   switch (result.outcome) {
@@ -110,7 +103,7 @@ function report(result) {
       return;
     default:
       process.exitCode = 1;
-      console.error(`not confirmed: ${explain(result.error)}`);
+      console.error(`not confirmed: ${explainError(result.error)}`);
       console.error('The current key is locked to this exact payment.');
       console.error('Run "qpv resume" to try again, or "qpv cancel" to call it off.');
   }
@@ -127,6 +120,7 @@ async function pay(wallet, conn, payer, plan) {
     console.log('not sent; nothing was signed');
     return;
   }
+  await wallet.requireFeeFunds(conn, payer.publicKey, plan, sendOptions());
   wallet.commit(plan);
   report(await wallet.sendPending(conn, payer, sendOptions()));
 }
@@ -141,11 +135,12 @@ const commands = {
       if (!/^[0-9a-fA-F]{64}$/.test(opt.seed)) throw new Error('--seed must be 64 hex characters');
       masterSeed = Buffer.from(opt.seed, 'hex');
     }
-    const wallet = Wallet.create(walletPath, { programId: new PublicKey(opt.program), url, masterSeed });
+    await requireImmutableProgram(new Connection(url, 'confirmed'), opt.program);
+    const wallet = createFileWallet(walletPath, { programId: new PublicKey(opt.program), url, masterSeed });
     console.log(`wallet written to ${walletPath}`);
     if (!opt.seed) {
       console.log('\nBACK UP THIS SEED. It is the only way to recover your vault:\n');
-      console.log(`  ${wallet.state.masterSeed}\n`);
+      console.log(`  ${wallet.masterSeed.toString('hex')}\n`);
     }
     console.log(`vault address: ${wallet.address.toBase58()}`);
   },
@@ -219,7 +214,7 @@ const commands = {
       return;
     }
     console.log(`cancel ${describe(p)} to ${p.recipient}`);
-    if (p.txids.length > 0) {
+    if (p.exposed) {
       console.log('This payment was already broadcast, so it may still go through before the cancel does.');
     }
     if (!(await confirm('Cancel it?'))) return;
@@ -253,7 +248,7 @@ if (opt.help || !command) {
   try {
     await commands[command]();
   } catch (error) {
-    console.error(`error: ${error.message}`);
+    console.error(`error: ${explainError(error)}`);
     process.exitCode = 1;
   }
 }

@@ -87,16 +87,20 @@ signature fit in one transaction.
 Needs Rust, Node 20+, and the [Solana CLI](https://docs.anza.xyz/cli/install).
 
 ```sh
-./scripts/localnet.sh              # builds the program, starts a local validator, prints the program id
+./scripts/localnet.sh              # builds, starts a local validator, deploys the program as final, prints its id
 
 # in a second terminal
 cd client
 npm install
-npm test                           # offline unit tests
-QPV_PROGRAM=<program id> npm run e2e
+npm test                                   # offline unit tests
+QPV_PROGRAM=<program id> npm run e2e       # the program, on the validator
+npm run web:build
+QPV_PROGRAM=<program id> npm run web:e2e   # the web wallet, in a headless browser
 ```
 
-`cargo test` in `program/` runs the native signature tests.
+`cargo test` in `program/` runs the native signature tests. The browser test
+uses Playwright's Chromium; set `QPV_CHROME` to a Chromium binary if
+Playwright's own is not installed.
 
 ## Use it on devnet
 
@@ -140,6 +144,55 @@ To restore on another machine: `qpv init --program <id> --seed <your seed>`.
 The wallet reads the vault's counter from the chain and carries on from the
 right key.
 
+`qpv init` checks the program on-chain first and refuses one that still has
+an upgrade authority.
+
+## Web wallet
+
+`client/web/` is the same wallet as a web page: create or restore a vault,
+see what it holds, send SOL and tokens, retry or cancel a stuck payment. It
+is a static site with no server of its own. It talks only to the Solana RPC
+address you give it.
+
+```sh
+cd client
+npm run web:dev        # http://127.0.0.1:5173/?program=<program id>&rpc=<rpc url>
+npm run web:build      # writes the site to ../docs
+```
+
+`docs/` is that built site, so GitHub Pages can serve it straight from this
+repository (Settings, Pages, deploy from branch `main`, folder `/docs`). Set
+`PROGRAM_ID` in `client/web/src/config.js` before building a copy for other
+people, so visitors are not asked to type in a program address.
+
+How the web version handles the things that matter:
+
+- **Seed.** Generated in the browser, shown once to write down, and stored
+  in the browser encrypted with your password (PBKDF2-SHA256, 600,000
+  rounds, then AES-256-GCM). The password cannot be reset; the written-down
+  seed is the only backup.
+- **Program.** Before creating a vault it checks on-chain that the program
+  has no upgrade authority, and refuses if it does. If the program and
+  network arrived through a link, it says so.
+- **Fees.** Paid either by a small fee wallet kept in the browser, which you
+  top up with about 0.01 SOL, or by a wallet extension such as Phantom.
+- **One signature per key.** The same lock as the command line tool, saved
+  to browser storage before anything is signed, and shared across tabs.
+- **Page contents.** No third-party scripts, fonts or trackers; a
+  content-security-policy blocks anything not shipped with the page.
+
+Limits specific to the web version:
+
+- Whoever hosts the page can change the code it serves. Only use a copy you
+  trust, or build and open your own.
+- Clearing the browser's site data deletes the vault from that browser. With
+  the seed you can restore it; without, the funds are unreachable. Do not
+  clear site data while a payment is pending.
+- A wallet extension sees a payment when asked to approve it. If you decline
+  there, the payment still has to be retried or cancelled here.
+- The extension path is tested against a stand-in that behaves like
+  Phantom's documented interface, not against Phantom itself.
+
 ## Rules for safe use
 
 A one-time key that signs two *different* messages leaks enough for someone
@@ -181,14 +234,17 @@ What you must not do:
 ## Layout
 
 ```
-program/src/wots.rs     signature verification
-program/src/lib.rs      Open, SpendSol, SpendToken, Cancel; vault state
-program/tests/          native tests, including a vector shared with the client
-client/src/wots.js      key derivation and signing (mirror of wots.rs)
-client/src/vault.js     addresses, instructions, transactions
-client/src/wallet.js    seed file, planning, and the one-signature-per-key bookkeeping
-client/src/cli.js       the qpv command
-client/test/            offline unit tests and the end-to-end test
+program/src/wots.rs       signature verification
+program/src/lib.rs        Open, SpendSol, SpendToken, Cancel; vault state
+program/tests/            native tests, including a vector shared with the client
+client/src/wots.js        key derivation and signing (mirror of wots.rs)
+client/src/vault.js       addresses, instructions, transactions
+client/src/wallet.js      planning and the one-signature-per-key bookkeeping (runs in Node and browsers)
+client/src/file-wallet.js wallet kept in a file, for the command line
+client/src/cli.js         the qpv command
+client/web/               the web wallet (page, browser storage, fee wallets)
+client/test/              offline unit tests, on-chain test, browser test
+docs/                     the built web wallet, ready for GitHub Pages
 ```
 
 ## What the tests cover
@@ -212,13 +268,24 @@ through the normal loader (78 checks):
 - Forty consecutive payments from one vault all succeed within the client's
   compute estimate.
 
-Offline (26 checks): the JavaScript and Rust implementations agree on a
+Offline (32 checks): the JavaScript and Rust implementations agree on a
 shared test vector; the wallet locks before signing, re-signs identically
 after failures, recognises its own payment after a crash or when a third
 party relays it, reports a payment as not sent when another copy of the
 wallet used the key first, refuses stale RPC data, and refuses frozen,
 hooked, paused and non-transferable tokens and misdirected recipients before
-signing.
+signing. A fee wallet that declines, or that alters the vault instruction,
+is handled safely; an underfunded one is caught before a key is locked; an
+upgradeable program is refused.
+
+In a real browser (21 checks, headless Chromium against the validator):
+create a vault, fund it, open it, send SOL and Token-2022 tokens, hit a
+frozen token account and cancel, lock and unlock, show the seed, restore in
+a second browser, two browsers and two tabs racing for one key, fees paid
+through a stand-in wallet extension including a declined approval, and
+removal. The seed is confirmed to be absent from browser storage in the
+clear, and no page logs a script error or a content-security-policy
+violation.
 
 ## Licence
 

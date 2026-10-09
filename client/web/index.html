@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="no-referrer" />
+    <!-- Everything this page runs is in this folder. It talks only to the Solana RPC you choose. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src https: wss: http://127.0.0.1:* ws://127.0.0.1:* http://localhost:* ws://localhost:*; base-uri 'none'; form-action 'none'"
+    />
+    <title>QP Vault</title>
+    <link rel="stylesheet" href="./src/style.css" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>QP Vault needs JavaScript. Everything runs in your browser; nothing is sent to a server.</noscript>
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
